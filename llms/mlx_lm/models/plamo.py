@@ -6,6 +6,7 @@ import mlx.nn as nn
 import numpy as np
 
 from .base import BaseModelArgs
+from .layers import RMSNorm
 
 
 @dataclass
@@ -17,23 +18,9 @@ class ModelArgs(BaseModelArgs):
     num_attention_heads: int
     rms_norm_eps: float
     vocab_size: int
-    n_shared_head: int = (8,)
+    n_shared_head: int = 8
     rope_theta: float = 10000
     rope_traditional: bool = False
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, dims: int, eps: float = 1e-5):
-        super().__init__()
-        self.weight = mx.ones((dims,))
-        self.variance_epsilon = eps
-
-    def _norm(self, x):
-        return x * mx.rsqrt(x.square().mean(-1, keepdims=True) + self.variance_epsilon)
-
-    def __call__(self, x):
-        output = self._norm(x.astype(mx.float32)).astype(x.dtype)
-        return self.weight * output
 
 
 class Attention(nn.Module):
@@ -93,16 +80,11 @@ class Attention(nn.Module):
             bsz, q_len, self.v_num_heads, self.v_dim
         ).transpose(0, 2, 1, 3)
 
-        def _expand_kv(a: mx.array) -> mx.array:
-            a = mx.concatenate(
-                [mx.expand_dims(a, 1)] * self.config.n_shared_head, axis=1
-            )
-            return a.reshape([bsz, self.q_num_heads, q_len, -1])
-
         # expand shared kv
         assert self.k_num_heads == self.v_num_heads
-        key_states = _expand_kv(key_states)
-        value_states = _expand_kv(value_states)
+        repeats = self.config.n_shared_head
+        key_states = mx.repeat(key_states, repeats, axis=1)
+        value_states = mx.repeat(value_states, repeats, axis=1)
 
         kv_seq_len = 0
         if cache is not None:
@@ -235,3 +217,7 @@ class Model(nn.Module):
     ) -> Tuple[mx.array, mx.array]:
         out, cache = self.model(inputs, cache)
         return self.lm_head(out), cache
+
+    @property
+    def layers(self):
+        return self.model.layers.layers

@@ -5,6 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs
+from .layers import RMSNorm
 
 
 @dataclass
@@ -24,20 +25,6 @@ class ModelArgs(BaseModelArgs):
     def __post_init__(self):
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, dims: int, eps: float = 1e-5):
-        super().__init__()
-        self.weight = mx.ones((dims,))
-        self.eps = eps
-
-    def _norm(self, x):
-        return x * mx.rsqrt(x.square().mean(-1, keepdims=True) + self.eps)
-
-    def __call__(self, x):
-        output = self._norm(x.astype(mx.float32)).astype(x.dtype)
-        return self.weight * output
 
 
 class Attention(nn.Module):
@@ -154,8 +141,7 @@ class QwenModel(nn.Module):
         for e, layer in enumerate(self.h):
             x, cache[e] = layer(x, mask, cache[e])
 
-        x = self.ln_f(x[:, T - 1 : T, :])
-        return x, cache
+        return self.ln_f(x), cache
 
 
 class Model(nn.Module):
@@ -175,3 +161,7 @@ class Model(nn.Module):
     ) -> Tuple[mx.array, mx.array]:
         y, cache = self.transformer(x, mask, cache)
         return self.lm_head(y), cache
+
+    @property
+    def layers(self):
+        return self.transformer.h
