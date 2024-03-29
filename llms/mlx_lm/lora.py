@@ -7,11 +7,13 @@ import re
 import types
 from pathlib import Path
 
+import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
 import yaml
 from mlx.utils import tree_flatten
 
+from .tuner.datasets import load_dataset
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.utils import linear_to_lora_layers
 from .utils import load
@@ -60,19 +62,6 @@ def build_parser():
     parser.add_argument(
         "--model",
         help="The path to the local model directory or Hugging Face repo.",
-    )
-    parser.add_argument(
-        "--max-tokens",
-        "-m",
-        type=int,
-        help="The maximum number of tokens to generate",
-    )
-    parser.add_argument("--temp", type=float, help="The sampling temperature")
-    parser.add_argument(
-        "--prompt",
-        "-p",
-        type=str,
-        help="The prompt for generation",
     )
 
     # Training args
@@ -154,44 +143,23 @@ def build_parser():
     return parser
 
 
-class Dataset:
-    """
-    Light-weight wrapper to hold lines from a jsonl file
-    """
+def print_trainable_parameters(model):
+    def nparams(m):
+        if isinstance(m, nn.QuantizedLinear):
+            return m.weight.size * (32 // m.bits)
+        return sum(v.size for _, v in tree_flatten(m.parameters()))
 
-    def __init__(self, path: Path, key: str = "text"):
-        if not path.exists():
-            self._data = None
-        else:
-            with open(path, "r") as fid:
-                self._data = [json.loads(l) for l in fid]
-        self._key = key
-
-    def __getitem__(self, idx: int):
-        return self._data[idx][self._key]
-
-    def __len__(self):
-        if self._data is None:
-            return 0
-        return len(self._data)
-
-
-def load_dataset(args):
-    names = ("train", "valid", "test")
-    train, valid, test = (Dataset(Path(args.data) / f"{n}.jsonl") for n in names)
-    if args.train and len(train) == 0:
-        raise ValueError(
-            "Training set not found or empty. Must provide training set for fine-tuning."
-        )
-    if args.train and len(valid) == 0:
-        raise ValueError(
-            "Validation set not found or empty. Must provide validation set for fine-tuning."
-        )
-    if args.test and len(test) == 0:
-        raise ValueError(
-            "Test set not found or empty. Must provide test set for evaluation."
-        )
-    return train, valid, test
+    leaf_modules = tree_flatten(
+        model.leaf_modules(), is_leaf=lambda m: isinstance(m, nn.Module)
+    )
+    total_p = sum(nparams(m) for _, m in leaf_modules) / 10**6
+    trainable_p = (
+        sum(v.size for _, v in tree_flatten(model.trainable_parameters())) / 10**6
+    )
+    print(
+        f"Trainable parameters: {(trainable_p * 100 / total_p):.3f}% "
+        f"({trainable_p:.3f}M/{total_p:.3f}M)"
+    )
 
 
 def run(args, training_callback: TrainingCallback = None):
@@ -205,39 +173,38 @@ def run(args, training_callback: TrainingCallback = None):
     # Convert linear layers to lora layers and unfreeze in the process
     linear_to_lora_layers(model, args.lora_layers, args.lora_parameters)
 
-    p = sum(v.size for _, v in tree_flatten(model.parameters())) / 10**6
-    print(f"Total parameters {p:.3f}M")
-    p = sum(v.size for _, v in tree_flatten(model.trainable_parameters())) / 10**6
-    print(f"Trainable parameters {p:.3f}M")
+    print_trainable_parameters(model)
 
     print("Loading datasets")
-    train_set, valid_set, test_set = load_dataset(args)
+    train_set, valid_set, test_set = load_dataset(args, tokenizer)
 
     # Resume training the given adapters.
     if args.resume_adapter_file is not None:
         print(f"Loading pretrained adapters from {args.resume_adapter_file}")
         model.load_weights(args.resume_adapter_file, strict=False)
-    # init training args
-    trainingArgs = TrainingArgs(
-        batch_size=args.batch_size,
-        iters=args.iters,
-        val_batches=args.val_batches,
-        steps_per_report=args.steps_per_report,
-        steps_per_eval=args.steps_per_eval,
-        steps_per_save=args.save_every,
-        adapter_file=args.adapter_file,
-        max_seq_length=args.max_seq_length,
-        grad_checkpoint=args.grad_checkpoint,
-    )
+
     if args.train:
         print("Training")
+        # init training args
+        training_args = TrainingArgs(
+            batch_size=args.batch_size,
+            iters=args.iters,
+            val_batches=args.val_batches,
+            steps_per_report=args.steps_per_report,
+            steps_per_eval=args.steps_per_eval,
+            steps_per_save=args.save_every,
+            adapter_file=args.adapter_file,
+            max_seq_length=args.max_seq_length,
+            grad_checkpoint=args.grad_checkpoint,
+        )
+
         model.train()
         opt = optim.Adam(learning_rate=args.learning_rate)
         # Train model
         train(
             model=model,
             tokenizer=tokenizer,
-            args=trainingArgs,
+            args=training_args,
             optimizer=opt,
             train_dataset=train_set,
             val_dataset=valid_set,
@@ -267,11 +234,6 @@ def run(args, training_callback: TrainingCallback = None):
         test_ppl = math.exp(test_loss)
 
         print(f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}.")
-
-    if args.prompt is not None:
-        raise NotImplementedError(
-            "Please use mlx_lm.generate with trained adapter for generation."
-        )
 
 
 if __name__ == "__main__":

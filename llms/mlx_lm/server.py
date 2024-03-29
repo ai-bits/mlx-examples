@@ -238,6 +238,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 A list of stop words passed to the stopping_criteria function
         """
         tokens = []
+        finish_reason = "length"
         for (token, _), _ in zip(
             generate_step(
                 prompt=prompt,
@@ -255,12 +256,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 tokens, stop_id_sequences, TOKENIZER.eos_token_id
             )
             if stop_condition.stop_met:
+                finish_reason = "stop"
                 if stop_condition.trim_length:
                     tokens = tokens[: -stop_condition.trim_length]
                 break
 
         text = TOKENIZER.decode(tokens)
-        response = self.generate_response(text, "stop", len(prompt), len(tokens))
+        response = self.generate_response(text, finish_reason, len(prompt), len(tokens))
 
         response_json = json.dumps(response).encode()
 
@@ -432,8 +434,18 @@ if __name__ == "__main__":
         default=8080,
         help="Port for the HTTP server (default: 8080)",
     )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Enable trusting remote code for tokenizer",
+    )
     args = parser.parse_args()
 
-    MODEL, TOKENIZER = load(args.model, adapter_file=args.adapter_file)
+    # Building tokenizer_config
+    tokenizer_config = {"trust_remote_code": True if args.trust_remote_code else None}
+
+    MODEL, TOKENIZER = load(
+        args.model, adapter_file=args.adapter_file, tokenizer_config=tokenizer_config
+    )
 
     run(args.host, args.port)
